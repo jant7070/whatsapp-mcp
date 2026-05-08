@@ -1,0 +1,9 @@
+{$DOMAIN} {
+    handle /bridge/* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle {
+        reverse_proxy whatsapp-mcp-cloud:8000
+    }
+}

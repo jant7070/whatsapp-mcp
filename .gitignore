@@ -1,0 +1,35 @@
+# Secrets / sensitive material
+.env
+*.key
+*.pem
+
+# WhatsApp auth state (Baileys multi-file auth) — NEVER commit
+auth_info/
+bridge/auth_info/
+
+# Node
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Runtime artifacts
+.qr.png
+
+# Planning workspace (kept local, not tracked)
+nimbalyst-local/

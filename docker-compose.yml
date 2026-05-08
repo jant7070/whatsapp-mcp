@@ -1,0 +1,72 @@
+# Local profile:  services bind to localhost, no Caddy
+# Cloud profile:  no direct port exposure for MCP, Caddy handles TLS
+
+services:
+  whatsapp-bridge:
+    build: ./bridge
+    env_file: .env
+    volumes:
+      - ./bridge/auth_info:/app/auth_info
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "Authorization: Bearer ${BRIDGE_API_KEY}"
+        - "http://localhost:${BRIDGE_PORT:-3001}/status"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles: [local, cloud]
+    # Loopback-only host binding even in cloud mode — only Caddy and the MCP
+    # service need to reach the bridge, never the public internet.
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-3001}:3001"
+
+  whatsapp-mcp:
+    build: ./mcp_server
+    env_file: .env
+    environment:
+      BRIDGE_URL: "http://whatsapp-bridge:3001"
+    depends_on:
+      whatsapp-bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    # Local profile: expose MCP directly on localhost.
+    profiles: [local]
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+
+  whatsapp-mcp-cloud:
+    build: ./mcp_server
+    env_file: .env
+    environment:
+      BRIDGE_URL: "http://whatsapp-bridge:3001"
+    depends_on:
+      whatsapp-bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    # Cloud profile: NO direct port exposure — Caddy proxies it.
+    profiles: [cloud]
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - whatsapp-mcp-cloud
+    restart: unless-stopped
+    profiles: [cloud]
+
+volumes:
+  caddy_data:
+  caddy_config:
