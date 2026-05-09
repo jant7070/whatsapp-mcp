@@ -6,13 +6,12 @@ Wraps the Baileys REST bridge as MCP tools. Single-user, personal-use only.
 from __future__ import annotations
 
 import os
-import re
 from typing import Any, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Configuration / startup checks
@@ -20,7 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "local")
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://whatsapp-bridge:3001")
-BIND_HOST = "0.0.0.0" if DEPLOYMENT_MODE == "cloud" else "127.0.0.1"
+# Bind to all interfaces inside the container; Docker's `127.0.0.1:NNNN:NNNN`
+# port mapping is what restricts host-side access to localhost in local mode.
+BIND_HOST = "0.0.0.0"
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 
 if not BRIDGE_API_KEY:
@@ -34,34 +35,25 @@ if DEPLOYMENT_MODE == "cloud" and len(BRIDGE_API_KEY) < 32:
         "Generate one with `openssl rand -hex 32`."
     )
 
-JID_PATTERN = re.compile(r"^[0-9]{7,15}(@s\.whatsapp\.net|@g\.us)?$")
-
-
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
 class SendMessageInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    jid: str = Field(
+    target: str = Field(
         ...,
+        min_length=1,
+        max_length=200,
         description=(
-            "Recipient JID or phone number with country code. "
-            "Examples: '5804120001234' or '5804120001234@s.whatsapp.net'. "
-            "Get JIDs from whatsapp_list_conversations."
+            "Recipient — accepts any of: a contact or chat name (e.g. 'Jireh Capote'), "
+            "a phone number with country code (e.g. '5804120001234'), or a full JID "
+            "(e.g. '5804120001234@s.whatsapp.net' for a chat or '<id>@g.us' for a group). "
+            "If a name matches multiple chats, the tool returns the candidates "
+            "instead of sending so you can disambiguate."
         ),
     )
     message: str = Field(..., min_length=1, max_length=4096, description="Text message to send.")
-
-    @field_validator("jid")
-    @classmethod
-    def validate_jid(cls, v: str) -> str:
-        if not JID_PATTERN.match(v):
-            raise ValueError(
-                "Invalid JID. Use phone number with country code "
-                "(e.g. '5804120001234') or full JID ending in @s.whatsapp.net or @g.us"
-            )
-        return v
 
 
 class GetMessagesInput(BaseModel):
@@ -75,6 +67,18 @@ class GetMessagesInput(BaseModel):
     search: Optional[str] = Field(
         default=None, max_length=200, description="Keyword to search in message body."
     )
+
+
+class SearchContactsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Substring to match (case-insensitive) against contact and chat names.",
+    )
+    limit: int = Field(default=20, ge=1, le=50, description="Max hits to return.")
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +145,15 @@ async def whatsapp_get_status() -> str:
     status = data.get("status", "unknown")
     has_qr = data.get("hasQr", False)
     cached = data.get("cachedMessages", 0)
+    known_chats = data.get("knownChats", 0)
+    known_contacts = data.get("knownContacts", 0)
     mode = data.get("deploymentMode", "unknown")
 
     if status == "connected":
-        human = f"Connected. {cached} messages cached. ({mode} mode)"
+        human = (
+            f"Connected. {known_chats} chats / {known_contacts} contacts known, "
+            f"{cached} recent messages buffered. ({mode} mode)"
+        )
     elif has_qr:
         human = f"Not linked yet — a QR is available. Call whatsapp_get_qr to scan. ({mode} mode)"
     else:
@@ -152,7 +161,8 @@ async def whatsapp_get_status() -> str:
 
     return (
         f"{human}\n\n"
-        f"status={status}, hasQr={has_qr}, cachedMessages={cached}, deploymentMode={mode}"
+        f"status={status}, hasQr={has_qr}, knownChats={known_chats}, "
+        f"knownContacts={known_contacts}, cachedMessages={cached}, deploymentMode={mode}"
     )
 
 
@@ -188,21 +198,30 @@ async def whatsapp_get_qr() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-async def whatsapp_list_conversations() -> str:
-    """List recent WhatsApp conversations cached by the bridge.
+async def whatsapp_list_conversations(limit: int = 50) -> str:
+    """List recent WhatsApp conversations from the bridge's chat directory.
 
-    Each entry includes the chat JID (use it with whatsapp_send_message), whether
-    it's a group, the last message body, the last message timestamp, and a contact
-    name when known.
+    Each entry includes the chat JID (use it with whatsapp_send_message or
+    whatsapp_get_messages), whether it's a group, the last message preview, the
+    last-message timestamp, and the resolved contact/group name. Names come from
+    the user's saved contacts when available, then the contact's pushName, then
+    a phone-number fallback.
+
+    Args:
+        limit: Max conversations to return (1-200, default 50).
     """
+    limit = max(1, min(int(limit), 200))
     try:
-        data = await _bridge_get("/conversations")
+        data = await _bridge_get("/conversations", params={"limit": limit})
     except Exception as e:
         return _handle_bridge_error(e)
 
     conversations = data.get("conversations", [])
     if not conversations:
-        return "No conversations cached yet. Receive or send a message first."
+        return (
+            "No conversations known yet. If you just linked a fresh QR, the bridge "
+            "may still be receiving the initial history sync — try again in a few seconds."
+        )
 
     lines = [f"{len(conversations)} conversation(s):", ""]
     for c in conversations:
@@ -211,6 +230,36 @@ async def whatsapp_list_conversations() -> str:
         lines.append(
             f"- jid={c.get('jid')} [{kind}] {name} "
             f"@ {c.get('lastTimestamp')}: {c.get('lastMessage', '')[:120]}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_search_contacts(input: SearchContactsInput) -> str:
+    """Search known chats and contacts by name (case-insensitive substring).
+
+    Use this to look up a JID before calling whatsapp_send_message, or to
+    confirm a contact exists. Matches are returned newest-first by last
+    activity. Results draw from both saved contact names and pushNames the
+    bridge has seen, plus group subjects.
+    """
+    try:
+        data = await _bridge_get(
+            "/chats/search", params={"q": input.query, "limit": input.limit}
+        )
+    except Exception as e:
+        return _handle_bridge_error(e)
+
+    hits = data.get("hits", [])
+    if not hits:
+        return f"No matches for '{input.query}'."
+
+    lines = [f"{len(hits)} match(es) for '{input.query}':", ""]
+    for h in hits:
+        kind = "group" if h.get("isGroup") else "chat"
+        lines.append(
+            f"- jid={h.get('jid')} [{kind}] {h.get('name')} "
+            f"@ {h.get('lastTimestamp')}"
         )
     return "\n".join(lines)
 
@@ -247,7 +296,9 @@ async def whatsapp_get_messages(input: GetMessagesInput) -> str:
     ]
     for m in messages:
         direction = "→" if m.get("isFromMe") else "←"
-        sender = m.get("fromName") or m.get("from") or "?"
+        # senderName is resolved by the bridge using saved contacts → pushName →
+        # phone-number fallback. It is "you" for outbound messages.
+        sender = m.get("senderName") or m.get("from") or "?"
         lines.append(
             f"[{m.get('timestamp')}] {direction} {sender} ({m.get('to')}): "
             f"{m.get('body', '')[:200]}"
@@ -263,16 +314,50 @@ async def whatsapp_get_messages(input: GetMessagesInput) -> str:
 async def whatsapp_send_message(input: SendMessageInput) -> str:
     """Send a text WhatsApp message.
 
-    Call ``whatsapp_get_status`` first to confirm the bridge is connected. The JID
-    must be a phone number with country code (e.g. ``5804120001234``) or a full
-    JID ending in ``@s.whatsapp.net`` (direct chat) or ``@g.us`` (group).
+    Call ``whatsapp_get_status`` first to confirm the bridge is connected. The
+    ``target`` accepts a contact/chat name, a phone number with country code,
+    or a full JID. Names are matched case-insensitively against saved contacts,
+    pushNames, and group subjects.
+
+    If the name matches multiple chats this tool returns the candidate list
+    instead of sending — pick one and call again with its JID.
     """
     try:
-        data = await _bridge_post("/send", {"jid": input.jid, "message": input.message})
+        data = await _bridge_post(
+            "/send", {"target": input.target, "message": input.message}
+        )
+    except httpx.HTTPStatusError as e:
+        # 409 Ambiguous → return the candidates so the caller can disambiguate.
+        if e.response.status_code == 409:
+            try:
+                payload = e.response.json()
+            except Exception:
+                return _handle_bridge_error(e)
+            candidates = payload.get("candidates", [])
+            lines = [
+                f"Did not send. '{input.target}' matched {len(candidates)} chats — "
+                "pick one and call whatsapp_send_message again with its JID:",
+                "",
+            ]
+            for c in candidates:
+                kind = "group" if c.get("isGroup") else "chat"
+                lines.append(
+                    f"- jid={c.get('jid')} [{kind}] {c.get('name')} "
+                    f"@ {c.get('lastTimestamp')}"
+                )
+            return "\n".join(lines)
+        if e.response.status_code == 404:
+            try:
+                detail = e.response.json().get("error", "Not found")
+            except Exception:
+                detail = "Not found"
+            return f"Did not send. {detail}"
+        return _handle_bridge_error(e)
     except Exception as e:
         return _handle_bridge_error(e)
     if data.get("ok"):
-        return f"Sent. message_id={data.get('id')}"
+        jid = data.get("jid", "")
+        return f"Sent to {jid}. message_id={data.get('id')}"
     return f"Send returned: {data}"
 
 

@@ -49,9 +49,10 @@ network. The QR pairing code is rendered directly in the bridge's terminal.
 Caddy is the only public-facing service. It terminates TLS and proxies:
 
 - the MCP traffic to `whatsapp-mcp-cloud:8000` (default route)
-- the bridge admin surface (`/qr`, `/status`, `/conversations`, `/messages`,
-  `/send`, `/logout`) at `/bridge/*` — auth-gated by Bearer token + rate
-  limit + HTTPS-enforce middleware in the bridge
+- the bridge admin surface (`/qr`, `/status`, `/conversations`,
+  `/chats/search`, `/messages`, `/send`, `/logout`) at `/bridge/*` —
+  auth-gated by Bearer token + rate limit + HTTPS-enforce middleware in
+  the bridge
 
 The bridge container is bound to `127.0.0.1` on the host as well — only
 Caddy and the MCP container can reach it.
@@ -62,12 +63,12 @@ Caddy and the MCP container can reach it.
 
 | Layer | What protects you |
 | --- | --- |
-| Network (local) | Both services bind to `127.0.0.1` only. |
+| Network (local) | Both services bind `0.0.0.0` inside their containers; Docker's `127.0.0.1:NNNN:NNNN` port mapping in `docker-compose.yml` restricts host-side access to localhost only. |
 | Network (cloud) | Only Caddy is public; bridge and MCP are loopback-only on the host. |
 | TLS | Caddy auto-issues Let's Encrypt certs; bridge returns **426 Upgrade Required** if `X-Forwarded-Proto` ≠ `https`. |
 | Auth | Bearer token (`BRIDGE_API_KEY`) on **every** route. Refuse to start if missing; refuse to start if shorter than 32 chars in cloud mode. |
 | Rate limiting | `POST /send`: 10/min. Everything else: 60/min. Returns **429** with `Retry-After`. |
-| Input validation | JID regex `^[0-9]{7,15}(@s\.whatsapp\.net|@g\.us)?$`. Messages capped at 4096 chars; control bytes stripped. Pydantic enforces the same rules at the MCP layer. |
+| Input validation | Send target is 1-200 chars; JIDs validated against `^[0-9]{7,15}(@s\.whatsapp\.net|@g\.us)?$` before dispatch; ambiguous name lookups return the candidate list instead of sending. Messages capped at 4096 chars; control bytes stripped. |
 | Logging | `{ts, method, path, status, ms, ip}` only. **Never** logs message bodies, JIDs, QR data, or auth tokens. |
 | Session file | `bridge/auth_info/` is gitignored; bridge warns at startup if it's group/world-readable on POSIX hosts. |
 | Bridge admin surface | Reachable only at `/bridge/*` behind Caddy TLS + Bearer + rate limit. |
@@ -118,12 +119,21 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full VPS walkthrough.
 
 | Tool | Read-only? | Purpose |
 | --- | --- | --- |
-| `whatsapp_get_status` | yes | Bridge connection state, cache size, and mode. |
+| `whatsapp_get_status` | yes | Bridge connection state, known chat/contact counts, and mode. |
 | `whatsapp_get_qr` | yes | Returns the pairing QR data (cloud mode). |
-| `whatsapp_list_conversations` | yes | Recent chats with last-message preview. |
+| `whatsapp_list_conversations` | yes | Recent chats from the bridge's chat directory, newest first. |
+| `whatsapp_search_contacts` | yes | Substring search over saved contacts, pushNames, and group subjects. |
 | `whatsapp_get_messages` | yes | Paginated, optionally filtered by JID/keyword. |
-| `whatsapp_send_message` | no | Sends a text. JID + message are validated and sanitized. |
+| `whatsapp_send_message` | no | Sends a text. `target` accepts a name, phone, or JID. Ambiguous names return candidates instead of sending. |
 | `whatsapp_logout` | no, **destructive** | Logs out and deletes `auth_info/`; requires re-pairing. |
+
+The chat and contact directories populate from Baileys' history sync,
+which only fires on a **fresh QR pairing**. On warm restarts (when
+`auth_info/` already has a session) Baileys skips the history sync and
+the directories start empty — they fill in as messages arrive or chats
+update. To get a full directory after a warm restart, send or receive a
+message in each chat you care about, or `whatsapp_logout` and re-pair to
+force a full history sync.
 
 ---
 
