@@ -1,5 +1,4 @@
 import express, { type Request, type Response, type NextFunction, type Express } from 'express';
-import rateLimit from 'express-rate-limit';
 
 import { buildRouter } from './routes';
 
@@ -11,9 +10,10 @@ interface AppDeps {
 export function buildApp({ apiKey, deploymentMode }: AppDeps): Express {
   const app = express();
   app.set('trust proxy', deploymentMode === 'cloud' ? 1 : false);
-  app.use(express.json({ limit: '256kb' }));
+  // Bumped from 256kb so /send/media base64 payloads up to ~32MB JSON-encoded fit.
+  app.use(express.json({ limit: '32mb' }));
 
-  // HTTPS enforcement (cloud only). Caddy sets X-Forwarded-Proto.
+  // HTTPS enforcement (cloud only).
   if (deploymentMode === 'cloud') {
     app.use((req: Request, res: Response, next: NextFunction) => {
       if (req.headers['x-forwarded-proto'] !== 'https') {
@@ -25,9 +25,7 @@ export function buildApp({ apiKey, deploymentMode }: AppDeps): Express {
     });
   }
 
-  // Safe request logger.
-  // Path-only — query strings are skipped because they may contain JIDs / search terms.
-  // Bodies, JIDs, QR data, and auth tokens are NEVER logged.
+  // Safe request logger — path-only.
   app.use((req: Request, res: Response, next: NextFunction) => {
     const start = Date.now();
     res.on('finish', () => {
@@ -54,15 +52,6 @@ export function buildApp({ apiKey, deploymentMode }: AppDeps): Express {
     }
     next();
   });
-
-  // Per-IP rate limit on everything; /send adds a stricter cap inside the router.
-  const generalLimiter = rateLimit({
-    windowMs: 60_000,
-    max: 60,
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-  app.use(generalLimiter);
 
   app.use(buildRouter());
 

@@ -10,22 +10,26 @@ import makeWASocket, {
   isJidStatusBroadcast,
   isJidNewsletter,
   isJidBroadcast,
+  proto,
 } from '@whiskeysockets/baileys';
 import qrcodeTerminal from 'qrcode-terminal';
 import * as fs from 'fs';
 import * as path from 'path';
 
-import { extractBody } from './extract';
+import { extractMeta, type ExtractResult } from './extract';
 import { canonicalJid, initLidStore } from './lidStore';
+import { getDb } from './db';
 import {
   chatBufferLength,
   deleteChat,
   insertMessage,
+  markMessageDeleted,
   recordPushName,
   resetAll,
   setGroupSubject,
   upsertChat,
   upsertContact,
+  updateMessageBody,
 } from './store';
 
 type Sock = ReturnType<typeof makeWASocket>;
@@ -39,6 +43,8 @@ const DEPLOYMENT_MODE = process.env.DEPLOYMENT_MODE || 'local';
 let sock: Sock | null = null;
 let latestQr: string | null = null;
 let connectionStatus: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+let connectionEstablishedAt = 0;
+let lastMessageAt = 0;
 
 export function getSock(): Sock | null {
   return sock;
@@ -52,11 +58,18 @@ export function getLatestQr(): string | null {
   return latestQr;
 }
 
+export function getConnectionUptimeSec(): number {
+  if (connectionStatus !== 'connected' || connectionEstablishedAt === 0) return 0;
+  return Math.floor((Date.now() - connectionEstablishedAt) / 1000);
+}
+
+export function getLastMessageAt(): number {
+  return lastMessageAt;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-// Whether a JID belongs in the user's "Chats" tab (excludes status broadcasts
-// and channel newsletters that pollute chat lists).
 export function isChatListJid(jid: string | undefined | null): jid is string {
   if (!jid) return false;
   if (isJidStatusBroadcast(jid)) return false;
@@ -64,10 +77,6 @@ export function isChatListJid(jid: string | undefined | null): jid is string {
   return true;
 }
 
-// Whether a JID should be allowed into our message store at all.
-// Broadcasts (incl. user-defined broadcast lists) and newsletters are filtered
-// here because they're one-way feeds, not conversational chats — including
-// them poisons "show me my recent messages" with status updates.
 function isStorableJid(jid: string | undefined | null): jid is string {
   if (!jid) return false;
   if (isJidBroadcast(jid)) return false;
@@ -75,7 +84,6 @@ function isStorableJid(jid: string | undefined | null): jid is string {
   return true;
 }
 
-// Baileys timestamps may be number | Long | null | undefined.
 function tsToNumber(t: unknown): number {
   if (t == null) return 0;
   if (typeof t === 'number') return t;
@@ -132,14 +140,71 @@ function ingestContact(c: Contact | Partial<Contact>): void {
   });
 }
 
+// Persist a media_refs row referencing the original Baileys IMessage proto.
+// We store the proto as a serialized blob so a later GET /media call can
+// re-hydrate it and pass to downloadMediaMessage().
+function persistMediaRef(
+  chatJid: string,
+  messageId: string,
+  meta: ExtractResult,
+): void {
+  if (!meta.media || !meta.mediaSource) return;
+  try {
+    const blob = proto.Message.encode(meta.mediaSource as proto.IMessage).finish();
+    const db = getDb();
+    db.prepare(
+      `INSERT OR REPLACE INTO media_refs
+       (message_id, chat_jid, kind, mime_type, file_name, file_size, caption, baileys_proto_blob)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      messageId,
+      chatJid,
+      meta.media.kind,
+      meta.media.mimeType ?? null,
+      meta.media.fileName ?? null,
+      meta.media.fileSize ?? null,
+      meta.media.caption ?? null,
+      Buffer.from(blob),
+    );
+  } catch (err) {
+    console.error('persistMediaRef:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+function persistExtra(
+  chatJid: string,
+  messageId: string,
+  meta: ExtractResult,
+): void {
+  if (meta.location) {
+    persistExtraRow(chatJid, messageId, 'location', meta.location);
+  } else if (meta.contact) {
+    persistExtraRow(chatJid, messageId, 'contact', meta.contact);
+  } else if (meta.poll) {
+    persistExtraRow(chatJid, messageId, 'poll', meta.poll);
+  }
+}
+
+function persistExtraRow(chatJid: string, messageId: string, kind: string, payload: unknown): void {
+  try {
+    const db = getDb();
+    db.prepare(
+      `INSERT OR REPLACE INTO message_extras (message_id, chat_jid, kind, payload)
+       VALUES (?, ?, ?, ?)`,
+    ).run(messageId, chatJid, kind, JSON.stringify(payload));
+  } catch (err) {
+    console.error('persistExtra:', err instanceof Error ? err.message : String(err));
+  }
+}
+
 function ingestMessage(msg: WAMessage): void {
   const rawRemote = msg.key?.remoteJid;
   const id = msg.key?.id;
   if (!id || !rawRemote) return;
   if (!isStorableJid(rawRemote)) return;
 
-  const body = extractBody(msg);
-  if (body == null) return; // system/protocol — skip silently
+  const meta = extractMeta(msg);
+  if (!meta) return; // system/protocol — skip silently.
 
   const remoteJid = canonicalJid(rawRemote);
   const isFromMe = !!msg.key.fromMe;
@@ -151,20 +216,46 @@ function ingestMessage(msg: WAMessage): void {
       ? msg.key.participant || rawRemote
       : rawRemote;
   const sender = canonicalJid(rawSender);
+  const timestamp = tsToNumber(msg.messageTimestamp);
 
-  insertMessage({
+  // Edits: do not insert a fresh message row — rewrite the original.
+  if (meta.kind === 'edit' && meta.edit?.targetMessageId) {
+    updateMessageBody(remoteJid, meta.edit.targetMessageId, meta.edit.newText, timestamp);
+    if (timestamp > lastMessageAt) lastMessageAt = timestamp;
+    return;
+  }
+  if (meta.kind === 'delete' && meta.edit?.targetMessageId) {
+    markMessageDeleted(remoteJid, meta.edit.targetMessageId, timestamp);
+    if (timestamp > lastMessageAt) lastMessageAt = timestamp;
+    return;
+  }
+  // Reactions are not stored as messages (no body) — drop silently.
+  if (meta.kind === 'reaction') return;
+
+  // Reply linkage from extendedTextMessage.contextInfo.stanzaId.
+  let replyToId: string | null = null;
+  const ctx = msg.message?.extendedTextMessage?.contextInfo;
+  if (ctx?.stanzaId) replyToId = ctx.stanzaId;
+
+  const inserted = insertMessage({
     id,
     chatJid: remoteJid,
     sender,
     fromName: msg.pushName || '',
-    body,
-    timestamp: tsToNumber(msg.messageTimestamp),
+    body: meta.text,
+    timestamp,
     isGroup,
     isFromMe,
+    replyToId,
+    messageKind: meta.kind,
   });
 
-  // Record the *sender's* pushName against their own JID. Never let an
-  // outbound message overwrite the chat's contact name with the user's name.
+  if (inserted) {
+    if (meta.media) persistMediaRef(remoteJid, id, meta);
+    if (meta.location || meta.contact || meta.poll) persistExtra(remoteJid, id, meta);
+  }
+
+  if (timestamp > lastMessageAt) lastMessageAt = timestamp;
   if (!isFromMe && msg.pushName) recordPushName(sender, msg.pushName);
 }
 
@@ -201,10 +292,12 @@ export async function startWhatsApp(): Promise<void> {
       connectionStatus = 'connecting';
     } else if (connection === 'open') {
       connectionStatus = 'connected';
+      connectionEstablishedAt = Date.now();
       latestQr = null;
       console.log('WhatsApp connection established.');
     } else if (connection === 'close') {
       connectionStatus = 'disconnected';
+      connectionEstablishedAt = 0;
       const err = lastDisconnect?.error as { output?: { statusCode?: number } } | undefined;
       const reason = err?.output?.statusCode;
       const loggedOut = reason === DisconnectReason.loggedOut;
@@ -265,8 +358,6 @@ export interface FetchOlderResult {
   total: number;
 }
 
-// Trigger Baileys' on-demand history fetch for a single chat. Returns once
-// either (a) the per-chat buffer length grows OR (b) timeoutMs elapses.
 export async function fetchOlderForChat(
   chatJid: string,
   count: number,
@@ -282,12 +373,10 @@ export async function fetchOlderForChat(
   const before = chatBufferLength(chatJid);
   await s.fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp);
 
-  // Poll the buffer; resolve early when growth is detected.
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const now = chatBufferLength(chatJid);
     if (now > before) {
-      // Give a brief window for any in-flight batch to fully drain.
       await sleep(250);
       const after = chatBufferLength(chatJid);
       return { requested: count, added: after - before, total: after };
@@ -302,28 +391,26 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Logout — best-effort socket logout + wipe auth dir + reset memory
+// Logout
 // ---------------------------------------------------------------------------
 export async function logoutAndReset(): Promise<void> {
   if (sock) {
     try {
       await sock.logout();
     } catch {
-      // Best-effort; even if WhatsApp rejects the logout we still wipe state.
+      // Best-effort.
     }
   }
   sock = null;
   connectionStatus = 'disconnected';
+  connectionEstablishedAt = 0;
   latestQr = null;
   resetAll();
-  // Wipe the contents of AUTH_DIR — not the directory itself. Under Docker
-  // the dir is bind-mounted from the host and rmdir on the mountpoint fails
-  // with EBUSY.
   try {
     for (const name of fs.readdirSync(AUTH_DIR)) {
       fs.rmSync(path.join(AUTH_DIR, name), { recursive: true, force: true });
     }
   } catch {
-    // Directory may not exist yet — nothing to wipe.
+    // not present yet — nothing to wipe.
   }
 }

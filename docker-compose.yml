@@ -7,6 +7,8 @@ services:
     env_file: .env
     volumes:
       - ./bridge/auth_info:/app/auth_info
+      - store_db:/data
+      - media_cache:/data/media
     healthcheck:
       test:
         - CMD
@@ -70,3 +72,5 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  store_db:
+  media_cache:

@@ -19,8 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "local")
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://whatsapp-bridge:3001")
-# Bind to all interfaces inside the container; Docker's `127.0.0.1:NNNN:NNNN`
-# port mapping is what restricts host-side access to localhost in local mode.
 BIND_HOST = "0.0.0.0"
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 
@@ -38,74 +36,138 @@ if DEPLOYMENT_MODE == "cloud" and len(BRIDGE_API_KEY) < 32:
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
-class SendMessageInput(BaseModel):
+class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+
+class SendMessageInput(_Base):
     target: str = Field(
-        ...,
-        min_length=1,
-        max_length=200,
+        ..., min_length=1, max_length=200,
         description=(
-            "Recipient — accepts any of: a contact or chat name (e.g. 'Jireh Capote'), "
-            "a phone number with country code (e.g. '5804120001234'), or a full JID "
-            "(e.g. '5804120001234@s.whatsapp.net' for a chat or '<id>@g.us' for a group). "
-            "If a name matches multiple chats, the tool returns the candidates "
-            "instead of sending so you can disambiguate."
+            "Recipient — accepts a contact/chat name, a phone number with country code, "
+            "or a full JID (e.g. '5804120001234@s.whatsapp.net' or '<id>@g.us'). "
+            "Ambiguous names return candidates instead of sending."
         ),
     )
     message: str = Field(..., min_length=1, max_length=4096, description="Text message to send.")
-
-
-class GetMessagesInput(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    jid: str = Field(
-        ...,
-        min_length=1,
-        max_length=200,
-        description=(
-            "Chat JID to fetch messages from. Get one from whatsapp_list_conversations "
-            "or whatsapp_search_contacts."
-        ),
-    )
-    limit: int = Field(default=50, ge=1, le=200, description="Max messages to return (newest first).")
-    before_timestamp: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description=(
-            "Unix-seconds cursor for pagination. Returns only messages with timestamp < "
-            "this value. Use the smallest timestamp from a previous page to walk older."
-        ),
+    idempotency_key: Optional[str] = Field(
+        default=None, max_length=128,
+        description="Optional 1-128 char printable-ASCII key. Replay returns the cached response.",
     )
 
 
-class FetchOlderInput(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    jid: str = Field(
-        ...,
-        min_length=1,
-        max_length=200,
-        description="Chat JID whose history should be backfilled.",
-    )
-    count: int = Field(
-        default=50,
-        ge=1,
-        le=200,
-        description="How many older messages to ask WhatsApp for (best-effort).",
-    )
+class SendMediaInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    kind: str = Field(..., description="image | document | video | audio | voice")
+    source_base64: Optional[str] = Field(default=None, description="Base64 payload (alternative to source_url).")
+    source_url: Optional[str] = Field(default=None, description="HTTPS URL to fetch (alternative to source_base64).")
+    file_name: Optional[str] = Field(default=None, max_length=255)
+    mime_type: Optional[str] = Field(default=None, max_length=128)
+    caption: Optional[str] = Field(default=None, max_length=1024)
+    voice: Optional[bool] = Field(default=False, description="Set true to send as a push-to-talk voice note.")
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
 
 
-class SearchContactsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+class DownloadMediaInput(_Base):
+    chat_jid: str = Field(..., min_length=1, max_length=200)
+    message_id: str = Field(..., min_length=1, max_length=200)
 
-    query: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="Substring to match (case-insensitive) against contact and chat names.",
-    )
-    limit: int = Field(default=20, ge=1, le=50, description="Max hits to return.")
+
+class SendLocationInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    name: Optional[str] = Field(default=None, max_length=128)
+    address: Optional[str] = Field(default=None, max_length=256)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class SendContactInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    name: str = Field(..., min_length=1, max_length=128)
+    phone: str = Field(..., min_length=7, max_length=20)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class SendPollInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    name: str = Field(..., min_length=1, max_length=256)
+    options: list[str] = Field(..., min_length=2, max_length=12)
+    selectable_count: int = Field(default=1, ge=1, le=12)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class ReplyInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1, max_length=4096)
+    quoted_message_id: str = Field(..., min_length=1, max_length=200)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class ReactInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    message_id: str = Field(..., min_length=1, max_length=200)
+    emoji: str = Field(..., max_length=32, description="Empty string removes the reaction.")
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class EditMessageInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    message_id: str = Field(..., min_length=1, max_length=200)
+    new_text: str = Field(..., min_length=1, max_length=4096)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class DeleteMessageInput(_Base):
+    target: str = Field(..., min_length=1, max_length=200)
+    message_id: str = Field(..., min_length=1, max_length=200)
+    scope: str = Field(..., description="me | everyone")
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class MarkReadInput(_Base):
+    jid: str = Field(..., min_length=1, max_length=200)
+
+
+class SearchMessagesInput(_Base):
+    query: str = Field(..., min_length=1, max_length=200)
+    jid: Optional[str] = Field(default=None, max_length=200)
+    kind: Optional[str] = Field(default=None, max_length=32)
+    since: Optional[int] = Field(default=None, ge=0)
+    until: Optional[int] = Field(default=None, ge=0)
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class UpdateMyProfileInput(_Base):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=25)
+    status: Optional[str] = Field(default=None, max_length=139)
+    avatar_base64: Optional[str] = Field(default=None)
+
+
+class GetContactProfileInput(_Base):
+    jid: str = Field(..., min_length=1, max_length=200)
+
+
+class AuditQueryInput(_Base):
+    tool: Optional[str] = Field(default=None, max_length=64)
+    since: Optional[int] = Field(default=None, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class GetMessagesInput(_Base):
+    jid: str = Field(..., min_length=1, max_length=200)
+    limit: int = Field(default=50, ge=1, le=200)
+    before_timestamp: Optional[int] = Field(default=None, ge=0)
+
+
+class FetchOlderInput(_Base):
+    jid: str = Field(..., min_length=1, max_length=200)
+    count: int = Field(default=50, ge=1, le=200)
+
+
+class SearchContactsInput(_Base):
+    query: str = Field(..., min_length=1, max_length=100)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 # ---------------------------------------------------------------------------
@@ -116,15 +178,22 @@ def _auth_headers() -> dict[str, str]:
 
 
 async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{BRIDGE_URL}{path}", params=params, headers=_auth_headers())
         resp.raise_for_status()
         return resp.json()
 
 
 async def _bridge_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(f"{BRIDGE_URL}{path}", json=body, headers=_auth_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _bridge_patch(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.patch(f"{BRIDGE_URL}{path}", json=body, headers=_auth_headers())
         resp.raise_for_status()
         return resp.json()
 
@@ -138,14 +207,13 @@ def _handle_bridge_error(e: Exception) -> str:
         if e.response.status_code == 426:
             return "Error: HTTPS required. The bridge is in cloud mode — use HTTPS."
         if e.response.status_code == 429:
-            return "Error: Rate limit exceeded. Wait before sending more messages."
-        if e.response.status_code == 404:
-            try:
-                detail = e.response.json().get("error", "Not found")
-            except Exception:
-                detail = "Not found"
-            return f"Error (404): {detail}"
-        return f"Error ({e.response.status_code}): {e.response.text}"
+            retry_after = e.response.headers.get("Retry-After", "?")
+            return f"Error: Rate limit exceeded. Retry after {retry_after}s."
+        try:
+            detail = e.response.json().get("error", e.response.text)
+        except Exception:
+            detail = e.response.text
+        return f"Error ({e.response.status_code}): {detail}"
     if isinstance(e, httpx.TimeoutException):
         return "Error: Bridge request timed out."
     return f"Error: {type(e).__name__}: {str(e)}"
@@ -157,13 +225,10 @@ def _handle_bridge_error(e: Exception) -> str:
 mcp = FastMCP("whatsapp-mcp", host=BIND_HOST, port=MCP_PORT)
 
 
+# ---- Read-only tools ---------------------------------------------------------
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_get_status() -> str:
-    """Check whether the WhatsApp bridge is connected and how many messages are cached.
-
-    Call this first to confirm the bridge is reachable and authenticated. If ``hasQr``
-    is true, no device is linked yet — call ``whatsapp_get_qr`` next.
-    """
+    """Connection state, message count, media-cache size, error rate, uptime."""
     try:
         data = await _bridge_get("/status")
     except Exception as e:
@@ -172,125 +237,82 @@ async def whatsapp_get_status() -> str:
     status = data.get("status", "unknown")
     has_qr = data.get("hasQr", False)
     cached = data.get("cachedMessages", 0)
-    known_chats = data.get("knownChats", 0)
-    known_contacts = data.get("knownContacts", 0)
+    chats = data.get("knownChats", 0)
+    contacts = data.get("knownContacts", 0)
     mode = data.get("deploymentMode", "unknown")
+    media_bytes = data.get("mediaCacheBytes", 0)
+    errors = data.get("errorsLastHour", 0)
+    uptime = data.get("connectionUptimeSec", 0)
+    last_msg = data.get("lastMessageAt", 0)
 
     if status == "connected":
         human = (
-            f"Connected. {known_chats} chats / {known_contacts} contacts known, "
-            f"{cached} recent messages buffered. ({mode} mode)"
+            f"Connected ({uptime}s uptime). {chats} chats / {contacts} contacts, "
+            f"{cached} messages stored. Media cache: {media_bytes} bytes. "
+            f"Errors last 1h: {errors}. last_message_at={last_msg}. ({mode} mode)"
         )
     elif has_qr:
-        human = f"Not linked yet — a QR is available. Call whatsapp_get_qr to scan. ({mode} mode)"
+        human = f"Not linked yet — QR available. Call whatsapp_get_qr. ({mode} mode)"
     else:
         human = f"Bridge is {status}, no QR available yet. ({mode} mode)"
 
-    return (
-        f"{human}\n\n"
-        f"status={status}, hasQr={has_qr}, knownChats={known_chats}, "
-        f"knownContacts={known_contacts}, cachedMessages={cached}, deploymentMode={mode}"
-    )
+    return human + f"\n\nraw={data}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_get_qr() -> str:
-    """Fetch the current pairing QR code so the operator can link a phone.
-
-    Returns the raw QR payload string. Open WhatsApp on your phone, go to
-    Settings → Linked Devices → Link a Device, then scan the rendered QR.
-    """
+    """Fetch the current pairing QR code so the operator can link a phone."""
     try:
         data = await _bridge_get("/qr")
     except Exception as e:
         return _handle_bridge_error(e)
-
     qr = data.get("qr")
     if not qr:
         return "No QR available — likely already linked. Call whatsapp_get_status to confirm."
-
-    instructions = (
+    return (
         "1. Open WhatsApp on your phone.\n"
         "2. Tap Settings → Linked Devices → Link a Device.\n"
-        "3. Point your phone at the rendered QR code below.\n"
+        "3. Scan the QR data below.\n\n"
+        f"QR data:\n{qr}"
     )
-    if DEPLOYMENT_MODE == "cloud":
-        instructions += (
-            "\nRender the QR locally with:\n"
-            '  python3 -c "import qrcode,sys; qrcode.make(sys.argv[1]).show()" "<qr_data>"\n'
-            "(install with: pip install \"qrcode[pil]\")\n"
-        )
-
-    return f"{instructions}\nQR data:\n{qr}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_list_conversations(limit: int = 50) -> str:
-    """List recent WhatsApp conversations from the bridge's chat directory.
-
-    Status broadcasts, broadcast lists, and channel newsletters are excluded.
-
-    Each entry includes the chat JID (use it with whatsapp_send_message or
-    whatsapp_get_messages), whether it's a group, the last message preview, the
-    last-message timestamp, and the resolved contact/group name. Names come from
-    the user's saved contacts when available, then the contact's pushName, then
-    a phone-number fallback (e.g. ``+5804120017``).
-
-    Args:
-        limit: Max conversations to return (1-200, default 50).
-    """
+    """List recent WhatsApp conversations, newest-first."""
     limit = max(1, min(int(limit), 200))
     try:
         data = await _bridge_get("/conversations", params={"limit": limit})
     except Exception as e:
         return _handle_bridge_error(e)
-
     conversations = data.get("conversations", [])
     if not conversations:
-        return (
-            "No conversations known yet. If you just linked a fresh QR, the bridge "
-            "may still be receiving the initial history sync — try again in a few seconds."
-        )
-
+        return "No conversations known yet."
     lines = [f"{len(conversations)} conversation(s):", ""]
     for c in conversations:
         kind = "group" if c.get("isGroup") else "chat"
         name = c.get("contactName") or "(no name)"
         lines.append(
-            f"- jid={c.get('jid')} [{kind}] {name} "
-            f"@ {c.get('lastTimestamp')}: {c.get('lastMessage', '')[:120]}"
+            f"- jid={c.get('jid')} [{kind}] {name} @ {c.get('lastTimestamp')}: "
+            f"{(c.get('lastMessage', '') or '')[:120]}"
         )
     return "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_search_contacts(input: SearchContactsInput) -> str:
-    """Search known chats and contacts by name (case-insensitive substring).
-
-    Use this to look up a JID before calling whatsapp_send_message, or to
-    confirm a contact exists. Matches are returned newest-first by last
-    activity. Results draw from both saved contact names and pushNames the
-    bridge has seen, plus group subjects. Status broadcasts, broadcast lists,
-    and channel newsletters are excluded.
-    """
+    """Search known chats and contacts by name (case-insensitive substring)."""
     try:
-        data = await _bridge_get(
-            "/chats/search", params={"q": input.query, "limit": input.limit}
-        )
+        data = await _bridge_get("/chats/search", params={"q": input.query, "limit": input.limit})
     except Exception as e:
         return _handle_bridge_error(e)
-
     hits = data.get("hits", [])
     if not hits:
         return f"No matches for '{input.query}'."
-
     lines = [f"{len(hits)} match(es) for '{input.query}':", ""]
     for h in hits:
         kind = "group" if h.get("isGroup") else "chat"
-        lines.append(
-            f"- jid={h.get('jid')} [{kind}] {h.get('name')} "
-            f"@ {h.get('lastTimestamp')}"
-        )
+        lines.append(f"- jid={h.get('jid')} [{kind}] {h.get('name')} @ {h.get('lastTimestamp')}")
     return "\n".join(lines)
 
 
@@ -298,155 +320,406 @@ async def whatsapp_search_contacts(input: SearchContactsInput) -> str:
 async def whatsapp_get_messages(input: GetMessagesInput) -> str:
     """Retrieve recent messages for one chat, newest-first.
 
-    Status broadcasts and channel newsletters are excluded. The bridge keeps
-    the last 200 messages per chat in memory; if you need more history than
-    that for a given chat, call ``whatsapp_fetch_older`` to ask WhatsApp for
-    older chunks, then call this tool again.
-
-    For pagination, pass ``before_timestamp`` set to the smallest timestamp
-    you saw in the previous page.
+    Includes media metadata, reply/edit/delete state, and structured extras
+    (location/contact/poll) when present. Use whatsapp_download_media to
+    pull media bytes lazily.
     """
     params: dict[str, Any] = {"jid": input.jid, "limit": input.limit}
     if input.before_timestamp is not None:
         params["before_timestamp"] = input.before_timestamp
-
     try:
         data = await _bridge_get("/messages", params=params)
     except Exception as e:
         return _handle_bridge_error(e)
-
     messages = data.get("messages", [])
     total = data.get("total", 0)
     has_more = data.get("hasMore", False)
     chat_name = data.get("chatName") or input.jid
-
     if not messages:
-        return (
-            f"No messages cached for {chat_name} ({input.jid}). "
-            "Try whatsapp_fetch_older to pull history from WhatsApp."
-        )
-
+        return f"No messages cached for {chat_name} ({input.jid}). Try whatsapp_fetch_older."
     lines = [
-        f"{chat_name} ({input.jid}) — showing {len(messages)} of {total} cached "
-        f"(hasMore={has_more}):",
+        f"{chat_name} ({input.jid}) — showing {len(messages)} of {total} (hasMore={has_more}):",
         "",
     ]
     for m in messages:
         direction = "→" if m.get("isFromMe") else "←"
-        # senderName is resolved by the bridge using saved contacts → pushName →
-        # phone-number fallback. It is "you" for outbound messages.
         sender = m.get("senderName") or m.get("sender") or "?"
-        lines.append(
-            f"[{m.get('timestamp')}] {direction} {sender}: {m.get('body', '')[:200]}"
-        )
+        prefix = f"[{m.get('timestamp')}] {direction} {sender}: "
+        body = (m.get("body", "") or "")[:200]
+        decor = []
+        if m.get("media"):
+            mm = m["media"]
+            decor.append(f"<media kind={mm.get('kind')} mime={mm.get('mimeType')} cached={mm.get('cached')} id={m.get('id')}>")
+        if m.get("extras"):
+            decor.append(f"<extras kind={m['extras'].get('kind')}>")
+        if m.get("replyToId"):
+            decor.append(f"<reply_to={m['replyToId']}>")
+        if m.get("editedAt"):
+            decor.append("<edited>")
+        if m.get("deletedAt"):
+            decor.append("<deleted>")
+        lines.append(prefix + body + (" " + " ".join(decor) if decor else ""))
     return "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_fetch_older(input: FetchOlderInput) -> str:
-    """Ask WhatsApp for older messages of a chat (best-effort, on-demand backfill).
-
-    The bridge anchors the request on the oldest message it currently has for
-    this chat and asks WhatsApp's server to deliver up to ``count`` older
-    messages. The actual number returned can be lower (or zero) — WhatsApp
-    rate-limits this and may have nothing more to send. Re-call to walk
-    further back.
-
-    Requires the chat to already have at least one cached message as an anchor;
-    if none exists, send or receive a message in that chat first.
-    """
+    """Backfill older messages of a chat from WhatsApp (best-effort)."""
     params: dict[str, Any] = {"jid": input.jid, "count": input.count}
     try:
         data = await _bridge_get("/messages/fetch_older", params=params)
     except Exception as e:
         return _handle_bridge_error(e)
-
     requested = data.get("requested", input.count)
     added = data.get("added", 0)
     total = data.get("total", 0)
-
     if added == 0:
-        return (
-            f"Requested {requested} older messages for {input.jid}; WhatsApp returned none. "
-            f"The chat now has {total} cached. Try again or accept that there's no more history."
-        )
-    return (
-        f"Backfilled {added} older messages for {input.jid} (requested {requested}). "
-        f"The chat now has {total} cached — call whatsapp_get_messages to read them."
-    )
+        return f"Requested {requested} older for {input.jid}; WhatsApp returned none. Total cached: {total}."
+    return f"Backfilled {added}/{requested} older for {input.jid}. Total cached: {total}."
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        readOnlyHint=False, destructiveHint=False, openWorldHint=True
-    )
-)
-async def whatsapp_send_message(input: SendMessageInput) -> str:
-    """Send a text WhatsApp message.
-
-    Call ``whatsapp_get_status`` first to confirm the bridge is connected. The
-    ``target`` accepts a contact/chat name, a phone number with country code,
-    or a full JID. Names are matched case-insensitively against saved contacts,
-    pushNames, and group subjects.
-
-    If the name matches multiple chats this tool returns the candidate list
-    instead of sending — pick one and call again with its JID.
-    """
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_search_messages(input: SearchMessagesInput) -> str:
+    """Full-text search across stored messages (FTS5, ranked by bm25)."""
+    params: dict[str, Any] = {"q": input.query, "limit": input.limit}
+    if input.jid:
+        params["jid"] = input.jid
+    if input.kind:
+        params["kind"] = input.kind
+    if input.since is not None:
+        params["since"] = input.since
+    if input.until is not None:
+        params["until"] = input.until
     try:
-        data = await _bridge_post(
-            "/send", {"target": input.target, "message": input.message}
+        data = await _bridge_get("/messages/search", params=params)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    hits = data.get("hits", [])
+    if not hits:
+        return f"No matches for '{input.query}'."
+    lines = [f"{len(hits)} hit(s) for '{input.query}':", ""]
+    for h in hits:
+        sender = h.get("senderName") or h.get("sender") or "?"
+        body = (h.get("body", "") or "")[:200]
+        lines.append(
+            f"- [{h.get('timestamp')}] chat={h.get('chatJid')} id={h.get('id')} from={sender}: {body}"
         )
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_get_my_profile() -> str:
+    """Own JID, display name, status, and avatar URL."""
+    try:
+        data = await _bridge_get("/profile/me")
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return (
+        f"jid={data.get('jid')}\n"
+        f"name={data.get('name')}\n"
+        f"status={data.get('status')}\n"
+        f"avatarUrl={data.get('avatarUrl')}"
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_get_contact_profile(input: GetContactProfileInput) -> str:
+    """Public profile for a JID (push name, avatar URL, presence)."""
+    try:
+        data = await _bridge_get(f"/profile/{input.jid}")
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return (
+        f"jid={data.get('jid')}\n"
+        f"pushName={data.get('pushName')}\n"
+        f"avatarUrl={data.get('avatarUrl')}\n"
+        f"presence={data.get('presence')}"
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_get_audit_log(input: AuditQueryInput) -> str:
+    """Read the audit log of every write tool's invocation. PII-redacted."""
+    params: dict[str, Any] = {"limit": input.limit}
+    if input.tool:
+        params["tool"] = input.tool
+    if input.since is not None:
+        params["since"] = input.since
+    try:
+        data = await _bridge_get("/audit", params=params)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    items = data.get("items", [])
+    if not items:
+        return "Audit log is empty for this query."
+    lines = [f"{len(items)} entrie(s):", ""]
+    for it in items:
+        lines.append(
+            f"- [{it.get('timestamp')}] {it.get('tool')} ok={it.get('ok')} "
+            f"target={it.get('targetJid')} err={it.get('errorCode')} "
+            f"summary={it.get('resultSummary')}"
+        )
+    return "\n".join(lines)
+
+
+# ---- Write tools -------------------------------------------------------------
+def _idem(body: dict[str, Any], key: Optional[str]) -> dict[str, Any]:
+    if key:
+        body["idempotency_key"] = key
+    return body
+
+
+def _format_send_response(data: dict[str, Any], default_label: str = "Sent") -> str:
+    if not data.get("ok"):
+        return f"{default_label} returned: {data}"
+    parts = [f"{default_label}."]
+    if data.get("id"):
+        parts.append(f"id={data['id']}")
+    if data.get("jid"):
+        parts.append(f"jid={data['jid']}")
+    if data.get("chatName"):
+        parts.append(f"chatName={data['chatName']}")
+    return " ".join(parts)
+
+
+def _ambiguity_message(target: str, payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates", [])
+    lines = [
+        f"Did not send. '{target}' matched {len(candidates)} chats — pick one and call again with its JID:",
+        "",
+    ]
+    for c in candidates:
+        kind = "group" if c.get("isGroup") else "chat"
+        lines.append(f"- jid={c.get('jid')} [{kind}] {c.get('name')} @ {c.get('lastTimestamp')}")
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_send_message(input: SendMessageInput) -> str:
+    """Send a text WhatsApp message."""
+    body = _idem({"target": input.target, "message": input.message}, input.idempotency_key)
+    try:
+        data = await _bridge_post("/send", body)
     except httpx.HTTPStatusError as e:
-        # 409 Ambiguous → return the candidates so the caller can disambiguate.
         if e.response.status_code == 409:
             try:
-                payload = e.response.json()
+                return _ambiguity_message(input.target, e.response.json())
             except Exception:
                 return _handle_bridge_error(e)
-            candidates = payload.get("candidates", [])
-            lines = [
-                f"Did not send. '{input.target}' matched {len(candidates)} chats — "
-                "pick one and call whatsapp_send_message again with its JID:",
-                "",
-            ]
-            for c in candidates:
-                kind = "group" if c.get("isGroup") else "chat"
-                lines.append(
-                    f"- jid={c.get('jid')} [{kind}] {c.get('name')} "
-                    f"@ {c.get('lastTimestamp')}"
-                )
-            return "\n".join(lines)
-        if e.response.status_code == 404:
-            try:
-                detail = e.response.json().get("error", "Not found")
-            except Exception:
-                detail = "Not found"
-            return f"Did not send. {detail}"
         return _handle_bridge_error(e)
     except Exception as e:
         return _handle_bridge_error(e)
-    if data.get("ok"):
-        jid = data.get("jid", "")
-        return f"Sent to {jid}. message_id={data.get('id')}"
-    return f"Send returned: {data}"
+    return _format_send_response(data)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_send_media(input: SendMediaInput) -> str:
+    """Send media (image, document, video, audio, voice). Provide either source_base64 or source_url."""
+    if not input.source_base64 and not input.source_url:
+        return "Error: must provide source_base64 or source_url."
+    if input.source_base64 and input.source_url:
+        return "Error: provide only one of source_base64 or source_url."
+    kind = "voice" if input.voice else input.kind
+    source: dict[str, Any] = {"type": "base64" if input.source_base64 else "url"}
+    if input.source_base64:
+        source["data"] = input.source_base64
+    if input.source_url:
+        source["url"] = input.source_url
+    if input.file_name:
+        source["fileName"] = input.file_name
+    if input.mime_type:
+        source["mimeType"] = input.mime_type
+    if input.caption:
+        source["caption"] = input.caption
+    body = _idem({"target": input.target, "kind": kind, "source": source}, input.idempotency_key)
+    try:
+        data = await _bridge_post("/send/media", body)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 409:
+            try:
+                return _ambiguity_message(input.target, e.response.json())
+            except Exception:
+                return _handle_bridge_error(e)
+        return _handle_bridge_error(e)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return _format_send_response(data, default_label=f"Sent {kind}")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_download_media(input: DownloadMediaInput) -> str:
+    """Lazily download media bytes for a previously-received message.
+
+    Returns base64 inline for small files; for large files, a short-lived
+    signed URL into the bridge.
+    """
+    try:
+        data = await _bridge_get(f"/media/{input.chat_jid}/{input.message_id}")
+    except Exception as e:
+        return _handle_bridge_error(e)
+    if data.get("base64"):
+        truncated = data["base64"][:80]
+        return (
+            f"Downloaded {data.get('kind')} ({data.get('size')} bytes, mime={data.get('mime')}). "
+            f"base64 (truncated): {truncated}…\n"
+            f"fileName={data.get('fileName')} cached={data.get('cached')}"
+        )
+    if data.get("url"):
+        return (
+            f"Downloaded {data.get('kind')} ({data.get('size')} bytes, mime={data.get('mime')}). "
+            f"signed_url={data['url']} (5 min expiry)\n"
+            f"fileName={data.get('fileName')} cached={data.get('cached')}"
+        )
+    return f"Unexpected response: {data}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_send_location(input: SendLocationInput) -> str:
+    body = _idem(
+        {
+            "target": input.target,
+            "latitude": input.latitude,
+            "longitude": input.longitude,
+            "name": input.name,
+            "address": input.address,
+        },
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/send/location", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return _format_send_response(data, default_label="Sent location")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_send_contact(input: SendContactInput) -> str:
+    body = _idem(
+        {"target": input.target, "contacts": [{"name": input.name, "phone": input.phone}]},
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/send/contact", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return _format_send_response(data, default_label="Sent contact")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_send_poll(input: SendPollInput) -> str:
+    body = _idem(
+        {
+            "target": input.target,
+            "name": input.name,
+            "options": input.options,
+            "selectableCount": input.selectable_count,
+        },
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/send/poll", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return _format_send_response(data, default_label="Sent poll")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_reply(input: ReplyInput) -> str:
+    body = _idem(
+        {
+            "target": input.target,
+            "message": input.message,
+            "quoted_message_id": input.quoted_message_id,
+        },
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/reply", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return _format_send_response(data, default_label="Sent reply")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+async def whatsapp_react(input: ReactInput) -> str:
+    body = _idem(
+        {"target": input.target, "message_id": input.message_id, "emoji": input.emoji},
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/react", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    if data.get("removed"):
+        return f"Reaction removed from {input.message_id} in {data.get('jid')}."
+    return f"Reacted {input.emoji!r} to {input.message_id} in {data.get('jid')}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+async def whatsapp_edit_message(input: EditMessageInput) -> str:
+    body = _idem(
+        {"target": input.target, "message_id": input.message_id, "new_text": input.new_text},
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/edit", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return f"Edited {data.get('edited')} in {input.target}. new_id={data.get('id')}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+async def whatsapp_delete_message(input: DeleteMessageInput) -> str:
+    if input.scope not in ("me", "everyone"):
+        return "Error: scope must be 'me' or 'everyone'."
+    body = _idem(
+        {"target": input.target, "message_id": input.message_id, "scope": input.scope},
+        input.idempotency_key,
+    )
+    try:
+        data = await _bridge_post("/delete", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return f"Deleted {data.get('deleted')} (scope={data.get('scope')})."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
+async def whatsapp_mark_read(input: MarkReadInput) -> str:
+    try:
+        data = await _bridge_post(f"/chats/{input.jid}/read", {})
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return f"Marked {input.jid} read through {data.get('markedThrough')}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def whatsapp_update_my_profile(input: UpdateMyProfileInput) -> str:
+    body: dict[str, Any] = {}
+    if input.name is not None:
+        body["name"] = input.name
+    if input.status is not None:
+        body["status"] = input.status
+    if input.avatar_base64 is not None:
+        body["avatar_base64"] = input.avatar_base64
+    if not body:
+        return "Nothing to update — pass at least one of name, status, avatar_base64."
+    try:
+        data = await _bridge_patch("/profile/me", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return f"Updated: {data.get('updated', [])}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
 async def whatsapp_logout() -> str:
-    """Log the bridge out of WhatsApp and delete the local auth_info session.
-
-    WARNING: This invalidates the linked-device session. You will need to re-scan
-    the QR code with your phone to use any other tool again.
-    """
+    """Log out of WhatsApp and delete auth_info/. Re-pair after."""
     try:
         data = await _bridge_post("/logout", {})
     except Exception as e:
         return _handle_bridge_error(e)
     return (
-        "Logged out. The auth_info/ folder has been deleted. "
-        "Re-authentication will be required: call whatsapp_get_qr after the bridge "
-        "produces a new QR.\n\n"
-        f"Bridge response: {data}"
+        "Logged out. The auth_info/ folder has been deleted. Re-scan QR after the bridge "
+        f"produces a new QR.\n\nBridge response: {data}"
     )
 
 

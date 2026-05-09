@@ -1,5 +1,62 @@
 {$DOMAIN} {
-    handle /bridge/* {
+    # Bridge admin surface — only the existing public-safe routes are exposed.
+    # /metrics, /audit, and /media/file/* stay internal (no route here).
+    handle /bridge/qr* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/status* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/conversations* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/chats/* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/messages* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/profile* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/send* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/reply* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/react* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/edit* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/delete* {
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/media/* {
+        # Top-level lazy-download endpoint /media/:chatJid/:messageId is OK to
+        # expose; /media/file/:token short-lived served-file route is NOT —
+        # the MCP server never returns a URL to the client in cloud mode.
+        @signed path_regexp ^/bridge/media/file/.+
+        handle @signed {
+            respond 404
+        }
+        uri strip_prefix /bridge
+        reverse_proxy whatsapp-bridge:3001
+    }
+    handle /bridge/logout* {
         uri strip_prefix /bridge
         reverse_proxy whatsapp-bridge:3001
     }

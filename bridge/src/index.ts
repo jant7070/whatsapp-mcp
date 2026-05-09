@@ -1,5 +1,8 @@
 import { buildApp } from './app';
 import { startWhatsApp } from './baileys';
+import { initDb } from './db';
+import { startMediaSweeper } from './media';
+import { startIdempotencyPurger } from './idempotency';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -28,6 +31,10 @@ if (DEPLOYMENT_MODE === 'cloud' && BRIDGE_API_KEY.length < 32) {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
+initDb();
+startMediaSweeper();
+startIdempotencyPurger();
+
 const app = buildApp({ apiKey: BRIDGE_API_KEY, deploymentMode: DEPLOYMENT_MODE });
 
 app.listen(BRIDGE_PORT, BIND_HOST, () => {
