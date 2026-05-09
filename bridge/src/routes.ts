@@ -10,6 +10,7 @@ import {
   logoutAndReset,
   startWhatsApp,
 } from './baileys';
+import { canonicalJid } from './lidStore';
 import {
   formatPhoneFallback,
   resolveChatName,
@@ -54,6 +55,13 @@ interface ResolveError {
 
 function resolveSendTarget(target: string): ResolvedTarget | ResolveError {
   const trimmed = target.trim();
+  // @lid passed in directly — try to resolve to a phone JID.
+  if (trimmed.endsWith('@lid')) {
+    const canonical = canonicalJid(trimmed);
+    if (canonical !== trimmed) return { jid: canonical };
+    // No mapping; fall through to send via the @lid transport directly.
+    return { jid: trimmed };
+  }
   if (/@(s\.whatsapp\.net|g\.us)$/.test(trimmed) && validateJid(trimmed)) {
     return { jid: trimmed };
   }
@@ -165,12 +173,13 @@ export function buildRouter(): Router {
   // GET /messages — jid required
   // -------------------------------------------------------------------------
   r.get('/messages', (req: Request, res: Response) => {
-    const jid = typeof req.query.jid === 'string' ? req.query.jid.trim() : '';
-    if (!jid) {
+    const rawJid = typeof req.query.jid === 'string' ? req.query.jid.trim() : '';
+    if (!rawJid) {
       return res
         .status(400)
         .json({ error: '`jid` query parameter is required. Use /chats/search to find one.' });
     }
+    const jid = canonicalJid(rawJid);
     const limit = clampLimit(req.query.limit, 50, 200);
     const beforeTs =
       typeof req.query.before_timestamp === 'string'
@@ -193,10 +202,11 @@ export function buildRouter(): Router {
   // GET /messages/fetch_older — on-demand backfill via Baileys
   // -------------------------------------------------------------------------
   r.get('/messages/fetch_older', async (req: Request, res: Response) => {
-    const jid = typeof req.query.jid === 'string' ? req.query.jid.trim() : '';
-    if (!jid) {
+    const rawJid = typeof req.query.jid === 'string' ? req.query.jid.trim() : '';
+    if (!rawJid) {
       return res.status(400).json({ error: '`jid` query parameter is required.' });
     }
+    const jid = canonicalJid(rawJid);
     if (getConnectionStatus() !== 'connected' || !getSock()) {
       return res
         .status(503)

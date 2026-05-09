@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 import { extractBody } from './extract';
+import { canonicalJid, initLidStore } from './lidStore';
 import {
   chatBufferLength,
   deleteChat,
@@ -105,8 +106,9 @@ function warnIfAuthDirInsecure(): void {
 // Ingestion — single funnel for both live messages and history-sync batches
 // ---------------------------------------------------------------------------
 function ingestChat(c: Chat | ChatUpdate): void {
-  const jid = c.id;
-  if (!isChatListJid(jid)) return;
+  const rawJid = c.id;
+  if (!isChatListJid(rawJid)) return;
+  const jid = canonicalJid(rawJid);
   const ts = tsToNumber(
     (c as Chat).conversationTimestamp ?? (c as Chat).lastMsgTimestamp,
   );
@@ -120,8 +122,9 @@ function ingestChat(c: Chat | ChatUpdate): void {
 }
 
 function ingestContact(c: Contact | Partial<Contact>): void {
-  const jid = c.id;
-  if (!jid) return;
+  const rawJid = c.id;
+  if (!rawJid) return;
+  const jid = canonicalJid(rawJid);
   upsertContact({
     jid,
     name: c.verifiedName || c.name || c.notify || '',
@@ -130,22 +133,24 @@ function ingestContact(c: Contact | Partial<Contact>): void {
 }
 
 function ingestMessage(msg: WAMessage): void {
-  const remoteJid = msg.key?.remoteJid;
+  const rawRemote = msg.key?.remoteJid;
   const id = msg.key?.id;
-  if (!id || !remoteJid) return;
-  if (!isStorableJid(remoteJid)) return;
+  if (!id || !rawRemote) return;
+  if (!isStorableJid(rawRemote)) return;
 
   const body = extractBody(msg);
   if (body == null) return; // system/protocol — skip silently
 
+  const remoteJid = canonicalJid(rawRemote);
   const isFromMe = !!msg.key.fromMe;
   const isGroup = remoteJid.endsWith('@g.us');
   const ownJid = sock?.user?.id;
-  const sender = isFromMe
+  const rawSender = isFromMe
     ? ownJid || 'me'
     : isGroup
-      ? msg.key.participant || remoteJid
-      : remoteJid;
+      ? msg.key.participant || rawRemote
+      : rawRemote;
+  const sender = canonicalJid(rawSender);
 
   insertMessage({
     id,
@@ -168,6 +173,7 @@ function ingestMessage(msg: WAMessage): void {
 // ---------------------------------------------------------------------------
 export async function startWhatsApp(): Promise<void> {
   warnIfAuthDirInsecure();
+  initLidStore(AUTH_DIR);
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 

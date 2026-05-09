@@ -1,8 +1,19 @@
 import { allContacts, getChat, getContact, listChats, type ContactRecord } from './store';
+import { isLidJid, lidToPhoneJid } from './lidStore';
 
 // Render a JID as +<digits> when no human-readable name is available.
 // Strips any device suffix like ":12" that appears on participant JIDs.
+//
+// `@lid` JIDs get special handling: the local-part of a Linked Identifier
+// is NOT a phone number, so formatting it as one would lie. We try to
+// resolve via the LID store first; if no mapping exists, we render a
+// neutral placeholder rather than fake +digits.
 export function formatPhoneFallback(jid: string): string {
+  if (isLidJid(jid)) {
+    const phoneJid = lidToPhoneJid(jid);
+    if (phoneJid) return formatPhoneFallback(phoneJid);
+    return '(linked id, phone unknown)';
+  }
   const local = jid.split('@')[0] || jid;
   const digits = local.split(':')[0]!.replace(/[^0-9]/g, '');
   return digits ? `+${digits}` : jid;
