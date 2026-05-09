@@ -59,13 +59,40 @@ class SendMessageInput(BaseModel):
 class GetMessagesInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    jid: Optional[str] = Field(
-        default=None, description="Filter by chat JID. Leave empty for all chats."
+    jid: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Chat JID to fetch messages from. Get one from whatsapp_list_conversations "
+            "or whatsapp_search_contacts."
+        ),
     )
-    limit: int = Field(default=20, ge=1, le=100, description="Max messages to return.")
-    offset: int = Field(default=0, ge=0, description="Pagination offset.")
-    search: Optional[str] = Field(
-        default=None, max_length=200, description="Keyword to search in message body."
+    limit: int = Field(default=50, ge=1, le=200, description="Max messages to return (newest first).")
+    before_timestamp: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Unix-seconds cursor for pagination. Returns only messages with timestamp < "
+            "this value. Use the smallest timestamp from a previous page to walk older."
+        ),
+    )
+
+
+class FetchOlderInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    jid: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Chat JID whose history should be backfilled.",
+    )
+    count: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="How many older messages to ask WhatsApp for (best-effort).",
     )
 
 
@@ -201,11 +228,13 @@ async def whatsapp_get_qr() -> str:
 async def whatsapp_list_conversations(limit: int = 50) -> str:
     """List recent WhatsApp conversations from the bridge's chat directory.
 
+    Status broadcasts, broadcast lists, and channel newsletters are excluded.
+
     Each entry includes the chat JID (use it with whatsapp_send_message or
     whatsapp_get_messages), whether it's a group, the last message preview, the
     last-message timestamp, and the resolved contact/group name. Names come from
     the user's saved contacts when available, then the contact's pushName, then
-    a phone-number fallback.
+    a phone-number fallback (e.g. ``+5804120017``).
 
     Args:
         limit: Max conversations to return (1-200, default 50).
@@ -241,7 +270,8 @@ async def whatsapp_search_contacts(input: SearchContactsInput) -> str:
     Use this to look up a JID before calling whatsapp_send_message, or to
     confirm a contact exists. Matches are returned newest-first by last
     activity. Results draw from both saved contact names and pushNames the
-    bridge has seen, plus group subjects.
+    bridge has seen, plus group subjects. Status broadcasts, broadcast lists,
+    and channel newsletters are excluded.
     """
     try:
         data = await _bridge_get(
@@ -266,16 +296,19 @@ async def whatsapp_search_contacts(input: SearchContactsInput) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_get_messages(input: GetMessagesInput) -> str:
-    """Retrieve cached messages, optionally filtered by chat JID and/or keyword.
+    """Retrieve recent messages for one chat, newest-first.
 
-    Results are paginated (``limit`` 1–100, ``offset`` ≥ 0) and ordered newest-first.
-    The bridge holds up to 500 recent messages in memory.
+    Status broadcasts and channel newsletters are excluded. The bridge keeps
+    the last 200 messages per chat in memory; if you need more history than
+    that for a given chat, call ``whatsapp_fetch_older`` to ask WhatsApp for
+    older chunks, then call this tool again.
+
+    For pagination, pass ``before_timestamp`` set to the smallest timestamp
+    you saw in the previous page.
     """
-    params: dict[str, Any] = {"limit": input.limit, "offset": input.offset}
-    if input.jid is not None:
-        params["jid"] = input.jid
-    if input.search is not None:
-        params["search"] = input.search
+    params: dict[str, Any] = {"jid": input.jid, "limit": input.limit}
+    if input.before_timestamp is not None:
+        params["before_timestamp"] = input.before_timestamp
 
     try:
         data = await _bridge_get("/messages", params=params)
@@ -285,25 +318,62 @@ async def whatsapp_get_messages(input: GetMessagesInput) -> str:
     messages = data.get("messages", [])
     total = data.get("total", 0)
     has_more = data.get("hasMore", False)
+    chat_name = data.get("chatName") or input.jid
 
     if not messages:
-        return f"No messages match (total={total})."
+        return (
+            f"No messages cached for {chat_name} ({input.jid}). "
+            "Try whatsapp_fetch_older to pull history from WhatsApp."
+        )
 
     lines = [
-        f"Showing {len(messages)} of {total} messages "
-        f"(offset={input.offset}, hasMore={has_more}):",
+        f"{chat_name} ({input.jid}) — showing {len(messages)} of {total} cached "
+        f"(hasMore={has_more}):",
         "",
     ]
     for m in messages:
         direction = "→" if m.get("isFromMe") else "←"
         # senderName is resolved by the bridge using saved contacts → pushName →
         # phone-number fallback. It is "you" for outbound messages.
-        sender = m.get("senderName") or m.get("from") or "?"
+        sender = m.get("senderName") or m.get("sender") or "?"
         lines.append(
-            f"[{m.get('timestamp')}] {direction} {sender} ({m.get('to')}): "
-            f"{m.get('body', '')[:200]}"
+            f"[{m.get('timestamp')}] {direction} {sender}: {m.get('body', '')[:200]}"
         )
     return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def whatsapp_fetch_older(input: FetchOlderInput) -> str:
+    """Ask WhatsApp for older messages of a chat (best-effort, on-demand backfill).
+
+    The bridge anchors the request on the oldest message it currently has for
+    this chat and asks WhatsApp's server to deliver up to ``count`` older
+    messages. The actual number returned can be lower (or zero) — WhatsApp
+    rate-limits this and may have nothing more to send. Re-call to walk
+    further back.
+
+    Requires the chat to already have at least one cached message as an anchor;
+    if none exists, send or receive a message in that chat first.
+    """
+    params: dict[str, Any] = {"jid": input.jid, "count": input.count}
+    try:
+        data = await _bridge_get("/messages/fetch_older", params=params)
+    except Exception as e:
+        return _handle_bridge_error(e)
+
+    requested = data.get("requested", input.count)
+    added = data.get("added", 0)
+    total = data.get("total", 0)
+
+    if added == 0:
+        return (
+            f"Requested {requested} older messages for {input.jid}; WhatsApp returned none. "
+            f"The chat now has {total} cached. Try again or accept that there's no more history."
+        )
+    return (
+        f"Backfilled {added} older messages for {input.jid} (requested {requested}). "
+        f"The chat now has {total} cached — call whatsapp_get_messages to read them."
+    )
 
 
 @mcp.tool(

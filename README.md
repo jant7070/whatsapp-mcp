@@ -121,19 +121,25 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full VPS walkthrough.
 | --- | --- | --- |
 | `whatsapp_get_status` | yes | Bridge connection state, known chat/contact counts, and mode. |
 | `whatsapp_get_qr` | yes | Returns the pairing QR data (cloud mode). |
-| `whatsapp_list_conversations` | yes | Recent chats from the bridge's chat directory, newest first. |
+| `whatsapp_list_conversations` | yes | Recent chats from the bridge's chat directory, newest first. Status broadcasts and newsletters excluded. |
 | `whatsapp_search_contacts` | yes | Substring search over saved contacts, pushNames, and group subjects. |
-| `whatsapp_get_messages` | yes | Paginated, optionally filtered by JID/keyword. |
+| `whatsapp_get_messages` | yes | Last N messages of one chat (`jid` required), newest first. Up to 200 per chat in memory. |
+| `whatsapp_fetch_older` | yes | On-demand backfill: ask WhatsApp for older messages of a chat. Best-effort and rate-limited by WhatsApp. |
 | `whatsapp_send_message` | no | Sends a text. `target` accepts a name, phone, or JID. Ambiguous names return candidates instead of sending. |
 | `whatsapp_logout` | no, **destructive** | Logs out and deletes `auth_info/`; requires re-pairing. |
 
-The chat and contact directories populate from Baileys' history sync,
-which only fires on a **fresh QR pairing**. On warm restarts (when
-`auth_info/` already has a session) Baileys skips the history sync and
-the directories start empty — they fill in as messages arrive or chats
-update. To get a full directory after a warm restart, send or receive a
-message in each chat you care about, or `whatsapp_logout` and re-pair to
-force a full history sync.
+State is **in-memory only** — there is no database. Caps:
+
+- Up to 1,000 chats and 5,000 contacts tracked.
+- Up to 200 messages per chat in a rolling buffer.
+- Status broadcasts, broadcast lists, and channel newsletters are filtered
+  at ingestion and never enter the store.
+
+A bridge restart drops the in-memory state. Baileys' post-reconnect
+`messaging-history.set` event repopulates the most active chats automatically
+(when `auth_info/` already has a session). For chats that don't get hydrated
+that way, call `whatsapp_fetch_older(jid)` to ask WhatsApp for older messages.
+A `whatsapp_logout` followed by re-pairing forces a full history sync.
 
 ---
 
