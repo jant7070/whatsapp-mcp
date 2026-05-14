@@ -1,7 +1,47 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import http from 'http';
+import { AddressInfo } from 'net';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildApp } from '../src/app';
 import { closeDb, initDb, truncateAll } from '../src/db';
+import { _resetAllBucketsForTests } from '../src/ratelimit';
 import { getChat } from '../src/store';
 import { refreshGroupSubjects } from '../src/baileys';
+
+// Module-mock baileys so getSock() returns a fake with a deterministic
+// groupFetchAllParticipating. getConnectionStatus must report 'connected'
+// so the route passes ensureConnected().
+vi.mock('../src/baileys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/baileys')>();
+  const fakeSock = {
+    groupFetchAllParticipating: async () => ({
+      '120363999@g.us': { id: '120363999@g.us', subject: 'Refreshed Subject' },
+    }),
+  };
+  return {
+    ...actual,
+    getSock: () => fakeSock,
+    getConnectionStatus: () => 'connected' as const,
+  };
+});
+
+const KEY = process.env.BRIDGE_API_KEY!;
+
+function listen(): Promise<{ url: string; close: () => Promise<void> }> {
+  const app = buildApp({ apiKey: KEY, deploymentMode: 'local' });
+  const server = http.createServer(app);
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        close: () =>
+          new Promise<void>((res) => {
+            server.close(() => res());
+          }),
+      });
+    });
+  });
+}
 
 beforeEach(() => {
   initDb({ path: ':memory:' });
@@ -49,5 +89,28 @@ describe('refreshGroupSubjects', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const out = await refreshGroupSubjects(fakeSock as any);
     expect(out.refreshed).toBe(0);
+  });
+});
+
+describe('POST /groups/refresh', () => {
+  beforeEach(() => {
+    _resetAllBucketsForTests();
+  });
+
+  it('writes subjects from groupFetchAllParticipating', async () => {
+    const { url, close } = await listen();
+    try {
+      const resp = await fetch(`${url}/groups/refresh`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${KEY}` },
+      });
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as { ok: boolean; groupsRefreshed: number };
+      expect(body.ok).toBe(true);
+      expect(body.groupsRefreshed).toBe(1);
+      expect(getChat('120363999@g.us')?.name).toBe('Refreshed Subject');
+    } finally {
+      await close();
+    }
   });
 });

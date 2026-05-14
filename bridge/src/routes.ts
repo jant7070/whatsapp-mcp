@@ -10,6 +10,7 @@ import {
   getSock,
   isChatListJid,
   logoutAndReset,
+  refreshGroupSubjects,
   startWhatsApp,
 } from './baileys';
 import { canonicalJid } from './lidStore';
@@ -1472,6 +1473,34 @@ export function buildRouter(): Router {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         res.status(500).json({ error: `Logout failed: ${msg}` });
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /groups/refresh — pull group subjects on demand. Same fetch the
+  // bridge runs on every reconnect, exposed for already-running sessions.
+  // -------------------------------------------------------------------------
+  r.post(
+    '/groups/refresh',
+    rateLimitMw({ keyFn: () => 'profile-write:global', capacityPerMinute: 5 }),
+    async (req: Request, res: Response) => {
+      const params: Record<string, unknown> = {};
+      if (!ensureConnected(res)) return res;
+      try {
+        const result = await refreshGroupSubjects(getSock()!);
+        return writeOk(
+          res,
+          { ok: true, groupsRefreshed: result.refreshed },
+          { tool: 'whatsapp_refresh_groups', params, req },
+        );
+      } catch (err) {
+        return writeFail(
+          res,
+          500,
+          `refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+          { tool: 'whatsapp_refresh_groups', params },
+        );
       }
     },
   );
