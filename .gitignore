@@ -33,3 +33,6 @@ Thumbs.db
 
 # Planning workspace (kept local, not tracked)
 nimbalyst-local/
+
+# Git worktrees
+.worktrees/
