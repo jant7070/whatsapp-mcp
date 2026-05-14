@@ -295,6 +295,21 @@ export async function startWhatsApp(): Promise<void> {
       connectionEstablishedAt = Date.now();
       latestQr = null;
       console.log('WhatsApp connection established.');
+      // Fire-and-forget: pull group subjects for every group we're in. Baileys
+      // does not replay group metadata for existing groups, so without this
+      // chats.name stays empty and /conversations returns blank names.
+      const s = sock;
+      if (s) {
+        refreshGroupSubjects(s)
+          .then((r) => {
+            if (r.refreshed > 0) {
+              console.log(`Group subjects refreshed: ${r.refreshed}`);
+            }
+          })
+          .catch(() => {
+            // refreshGroupSubjects already logs internally.
+          });
+      }
     } else if (connection === 'close') {
       connectionStatus = 'disconnected';
       connectionEstablishedAt = 0;
@@ -388,6 +403,34 @@ export async function fetchOlderForChat(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Group metadata refresh
+// ---------------------------------------------------------------------------
+// Baileys only emits `groups.upsert` / `groups.update` for groups that change
+// during the session. Existing groups need an explicit fetch — call this on
+// connect and from POST /groups/refresh.
+export async function refreshGroupSubjects(
+  s: Sock,
+): Promise<{ refreshed: number }> {
+  try {
+    const all = await s.groupFetchAllParticipating();
+    let n = 0;
+    for (const meta of Object.values(all)) {
+      const { id, subject } = meta;
+      if (!id || !subject) continue;
+      setGroupSubject(id, subject);
+      n += 1;
+    }
+    return { refreshed: n };
+  } catch (err) {
+    console.error(
+      'refreshGroupSubjects:',
+      err instanceof Error ? err.message : String(err),
+    );
+    return { refreshed: 0 };
+  }
 }
 
 // ---------------------------------------------------------------------------
