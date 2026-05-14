@@ -403,8 +403,7 @@ export async function refreshGroupSubjects(
     const all = await s.groupFetchAllParticipating();
     let n = 0;
     for (const meta of Object.values(all)) {
-      const id = (meta as { id?: string }).id;
-      const subject = (meta as { subject?: string }).subject;
+      const { id, subject } = meta;
       if (!id || !subject) continue;
       setGroupSubject(id, subject);
       n += 1;
