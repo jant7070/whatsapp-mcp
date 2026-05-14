@@ -295,6 +295,21 @@ export async function startWhatsApp(): Promise<void> {
       connectionEstablishedAt = Date.now();
       latestQr = null;
       console.log('WhatsApp connection established.');
+      // Fire-and-forget: pull group subjects for every group we're in. Baileys
+      // does not replay group metadata for existing groups, so without this
+      // chats.name stays empty and /conversations returns blank names.
+      const s = sock;
+      if (s) {
+        refreshGroupSubjects(s)
+          .then((r) => {
+            if (r.refreshed > 0) {
+              console.log(`Group subjects refreshed: ${r.refreshed}`);
+            }
+          })
+          .catch(() => {
+            // refreshGroupSubjects already logs internally.
+          });
+      }
     } else if (connection === 'close') {
       connectionStatus = 'disconnected';
       connectionEstablishedAt = 0;
