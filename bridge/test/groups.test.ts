@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app';
 import { closeDb, initDb, truncateAll } from '../src/db';
 import { _resetAllBucketsForTests } from '../src/ratelimit';
-import { getChat } from '../src/store';
+import { getChat, setGroupSubject } from '../src/store';
 import { refreshGroupSubjects } from '../src/baileys';
 
 // Module-mock baileys so getSock() returns a fake with a deterministic
@@ -109,6 +109,51 @@ describe('POST /groups/refresh', () => {
       expect(body.ok).toBe(true);
       expect(body.groupsRefreshed).toBe(1);
       expect(getChat('120363999@g.us')?.name).toBe('Refreshed Subject');
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('group subject is visible to read routes', () => {
+  beforeEach(() => {
+    _resetAllBucketsForTests();
+  });
+
+  it('GET /conversations returns the group subject as contactName', async () => {
+    setGroupSubject('120363aaa@g.us', 'El conter');
+    const { url, close } = await listen();
+    try {
+      const resp = await fetch(`${url}/conversations?limit=50`, {
+        headers: { Authorization: `Bearer ${KEY}` },
+      });
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as {
+        conversations: Array<{ jid: string; contactName: string; isGroup: boolean }>;
+      };
+      const hit = body.conversations.find((c) => c.jid === '120363aaa@g.us');
+      expect(hit).toBeDefined();
+      expect(hit?.contactName).toBe('El conter');
+      expect(hit?.isGroup).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it('GET /chats/search finds the group by subject substring', async () => {
+    setGroupSubject('120363bbb@g.us', 'Banesco vacantes Caracas');
+    const { url, close } = await listen();
+    try {
+      const resp = await fetch(`${url}/chats/search?q=banesco&limit=20`, {
+        headers: { Authorization: `Bearer ${KEY}` },
+      });
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as {
+        hits: Array<{ jid: string; name: string }>;
+      };
+      const hit = body.hits.find((h) => h.jid === '120363bbb@g.us');
+      expect(hit).toBeDefined();
+      expect(hit?.name).toBe('Banesco vacantes Caracas');
     } finally {
       await close();
     }
