@@ -391,6 +391,35 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Group metadata refresh
+// ---------------------------------------------------------------------------
+// Baileys only emits `groups.upsert` / `groups.update` for groups that change
+// during the session. Existing groups need an explicit fetch — call this on
+// connect and from POST /groups/refresh.
+export async function refreshGroupSubjects(
+  s: Sock,
+): Promise<{ refreshed: number }> {
+  try {
+    const all = await s.groupFetchAllParticipating();
+    let n = 0;
+    for (const meta of Object.values(all)) {
+      const id = (meta as { id?: string }).id;
+      const subject = (meta as { subject?: string }).subject;
+      if (!id || !subject) continue;
+      setGroupSubject(id, subject);
+      n += 1;
+    }
+    return { refreshed: n };
+  } catch (err) {
+    console.error(
+      'refreshGroupSubjects:',
+      err instanceof Error ? err.message : String(err),
+    );
+    return { refreshed: 0 };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Logout
 // ---------------------------------------------------------------------------
 export async function logoutAndReset(): Promise<void> {
