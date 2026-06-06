@@ -5,12 +5,15 @@ Wraps the Baileys REST bridge as MCP tools. Single-user, personal-use only.
 
 from __future__ import annotations
 
+import base64
+import logging
 import os
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
-from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
@@ -19,8 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "local")
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://whatsapp-bridge:3001")
+BRIDGE_PUBLIC_BASE_URL = os.getenv("BRIDGE_PUBLIC_BASE_URL")
 BIND_HOST = "0.0.0.0"
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+MCP_IMAGE_INLINE_MAX_BYTES = int(os.getenv("MCP_IMAGE_INLINE_MAX_MB", "5")) * 1024 * 1024
 
 if not BRIDGE_API_KEY:
     raise RuntimeError(
@@ -31,6 +36,13 @@ if DEPLOYMENT_MODE == "cloud" and len(BRIDGE_API_KEY) < 32:
     raise RuntimeError(
         "BRIDGE_API_KEY must be at least 32 characters in cloud mode. "
         "Generate one with `openssl rand -hex 32`."
+    )
+
+if DEPLOYMENT_MODE == "cloud" and not BRIDGE_PUBLIC_BASE_URL:
+    logging.warning(
+        "DEPLOYMENT_MODE=cloud but BRIDGE_PUBLIC_BASE_URL is not set — signed media URLs "
+        "will use whatever Host header the bridge receives and may leak the internal "
+        "docker hostname. Set BRIDGE_PUBLIC_BASE_URL to your public bridge origin."
     )
 
 # ---------------------------------------------------------------------------
@@ -148,6 +160,23 @@ class GetContactProfileInput(_Base):
     jid: str = Field(..., min_length=1, max_length=200)
 
 
+class SetContactNameInput(_Base):
+    jid: str = Field(
+        ..., min_length=1, max_length=200,
+        description="Phone JID (e.g. '5804120001234@s.whatsapp.net' or '<id>@g.us').",
+    )
+    name: str = Field(
+        ..., min_length=1, max_length=25,
+        description="Display name to use for this contact (overrides Baileys' c.name/pushName).",
+    )
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class ClearContactNameInput(_Base):
+    jid: str = Field(..., min_length=1, max_length=200)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
 class AuditQueryInput(_Base):
     tool: Optional[str] = Field(default=None, max_length=64)
     since: Optional[int] = Field(default=None, ge=0)
@@ -196,6 +225,59 @@ async def _bridge_patch(path: str, body: dict[str, Any]) -> dict[str, Any]:
         resp = await client.patch(f"{BRIDGE_URL}{path}", json=body, headers=_auth_headers())
         resp.raise_for_status()
         return resp.json()
+
+
+async def _bridge_put(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.put(f"{BRIDGE_URL}{path}", json=body, headers=_auth_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _bridge_delete(path: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.delete(f"{BRIDGE_URL}{path}", headers=_auth_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _fetch_image_bytes(data: dict[str, Any]) -> bytes | None:
+    """Return raw image bytes for an inline `whatsapp_download_media` response.
+
+    If the bridge returned base64, decode it. Otherwise fetch the signed-URL
+    path against the *internal* BRIDGE_URL (the public host may be unreachable
+    from the MCP container). Any failure returns None so the caller can fall
+    back to the URL-string response shape.
+    """
+    b64 = data.get("base64")
+    if b64:
+        try:
+            return base64.b64decode(b64)
+        except Exception:
+            return None
+    url = data.get("url")
+    if not url:
+        return None
+    try:
+        path = urlsplit(url).path
+        # Caddyfile fronts the bridge under /bridge/* in cloud mode — strip that
+        # prefix so we hit the right route on the internal origin.
+        if path.startswith("/bridge/"):
+            path = path[len("/bridge"):]
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{BRIDGE_URL}{path}", headers=_auth_headers())
+            resp.raise_for_status()
+            return resp.content
+    except Exception:
+        return None
+
+
+def _image_format_from_mime(mime: str | None) -> str:
+    if not mime or "/" not in mime:
+        return "png"
+    subtype = mime.split("/", 1)[1].lower()
+    # `image/jpeg` → "jpeg"; some hosts use "jpg".
+    return "jpeg" if subtype == "jpg" else subtype
 
 
 def _handle_bridge_error(e: Exception) -> str:
@@ -424,13 +506,19 @@ async def whatsapp_get_my_profile() -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def whatsapp_get_contact_profile(input: GetContactProfileInput) -> str:
-    """Public profile for a JID (push name, avatar URL, presence)."""
+    """Public profile for a JID (push name, avatar URL, presence).
+
+    The bridge enforces a per-call deadline against WhatsApp; if WA is slow,
+    `stale=true` indicates the response came from the on-disk cache rather
+    than a live read.
+    """
     try:
         data = await _bridge_get(f"/profile/{input.jid}")
     except Exception as e:
         return _handle_bridge_error(e)
+    stale_marker = " (stale, served from cache)" if data.get("stale") else ""
     return (
-        f"jid={data.get('jid')}\n"
+        f"jid={data.get('jid')}{stale_marker}\n"
         f"pushName={data.get('pushName')}\n"
         f"avatarUrl={data.get('avatarUrl')}\n"
         f"presence={data.get('presence')}"
@@ -547,27 +635,45 @@ async def whatsapp_send_media(input: SendMediaInput) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-async def whatsapp_download_media(input: DownloadMediaInput) -> str:
+async def whatsapp_download_media(input: DownloadMediaInput):
     """Lazily download media bytes for a previously-received message.
 
-    Returns base64 inline for small files; for large files, a short-lived
-    signed URL into the bridge.
+    Images small enough to inline (size ≤ MCP_IMAGE_INLINE_MAX_MB, default 5 MB)
+    come back as an MCP `Image` block so Claude can see them directly. Larger
+    images and non-image media fall through to a signed-URL string response.
     """
     try:
         data = await _bridge_get(f"/media/{input.chat_jid}/{input.message_id}")
     except Exception as e:
         return _handle_bridge_error(e)
-    if data.get("base64"):
-        truncated = data["base64"][:80]
-        return (
-            f"Downloaded {data.get('kind')} ({data.get('size')} bytes, mime={data.get('mime')}). "
-            f"base64 (truncated): {truncated}…\n"
-            f"fileName={data.get('fileName')} cached={data.get('cached')}"
-        )
+
+    size = data.get("size", 0) or 0
+    if (
+        data.get("kind") == "image"
+        and 0 < size <= MCP_IMAGE_INLINE_MAX_BYTES
+    ):
+        image_bytes = await _fetch_image_bytes(data)
+        if image_bytes is not None:
+            fmt = _image_format_from_mime(data.get("mime"))
+            metadata = (
+                f"Downloaded image ({size} bytes, mime={data.get('mime')}). "
+                f"fileName={data.get('fileName')} cached={data.get('cached')}"
+            )
+            return [
+                Image(data=image_bytes, format=fmt),
+                TextContent(type="text", text=metadata),
+            ]
+
     if data.get("url"):
         return (
             f"Downloaded {data.get('kind')} ({data.get('size')} bytes, mime={data.get('mime')}). "
             f"signed_url={data['url']} (5 min expiry)\n"
+            f"fileName={data.get('fileName')} cached={data.get('cached')}"
+        )
+    if data.get("base64"):
+        return (
+            f"Downloaded {data.get('kind')} ({data.get('size')} bytes, mime={data.get('mime')}). "
+            f"base64={data['base64']}\n"
             f"fileName={data.get('fileName')} cached={data.get('cached')}"
         )
     return f"Unexpected response: {data}"
@@ -708,6 +814,36 @@ async def whatsapp_update_my_profile(input: UpdateMyProfileInput) -> str:
     except Exception as e:
         return _handle_bridge_error(e)
     return f"Updated: {data.get('updated', [])}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def whatsapp_set_contact_name(input: SetContactNameInput) -> str:
+    """Override the display name shown for a contact.
+
+    Use when WhatsApp's contact list shows the wrong name (e.g. the
+    contact's own pushName instead of your saved phone-book label).
+    The override always wins over Baileys' c.name and c.pushName.
+    """
+    body: dict[str, Any] = {"name": input.name}
+    if input.idempotency_key:
+        body["idempotency_key"] = input.idempotency_key
+    try:
+        data = await _bridge_put(f"/contacts/{input.jid}/name", body)
+    except Exception as e:
+        return _handle_bridge_error(e)
+    return f"Set display name for {data.get('jid')} to {data.get('name')!r}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+async def whatsapp_clear_contact_name(input: ClearContactNameInput) -> str:
+    """Remove a contact-name override. Falls back to Baileys' name/pushName."""
+    try:
+        data = await _bridge_delete(f"/contacts/{input.jid}/name")
+    except Exception as e:
+        return _handle_bridge_error(e)
+    if data.get("removed"):
+        return f"Cleared display-name override for {data.get('jid')}."
+    return f"No override existed for {data.get('jid')}."
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))

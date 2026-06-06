@@ -2,6 +2,7 @@ import { buildApp } from './app';
 import { startWhatsApp } from './baileys';
 import { initDb } from './db';
 import { startMediaSweeper } from './media';
+import { startProfileSweeper } from './profile';
 import { startIdempotencyPurger } from './idempotency';
 
 // ---------------------------------------------------------------------------
@@ -28,11 +29,18 @@ if (DEPLOYMENT_MODE === 'cloud' && BRIDGE_API_KEY.length < 32) {
   process.exit(1);
 }
 
+if (DEPLOYMENT_MODE === 'cloud' && !process.env.BRIDGE_PUBLIC_BASE_URL) {
+  console.warn(
+    'WARN: Cloud mode without BRIDGE_PUBLIC_BASE_URL — signed media URLs will use the request Host header and may leak docker-internal hostnames.',
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 initDb();
 startMediaSweeper();
+startProfileSweeper();
 startIdempotencyPurger();
 
 const app = buildApp({ apiKey: BRIDGE_API_KEY, deploymentMode: DEPLOYMENT_MODE });
